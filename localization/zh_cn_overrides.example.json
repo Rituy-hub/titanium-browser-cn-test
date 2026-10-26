@@ -1,0 +1,6 @@
+{
+  "_说明": "将需要新增/修正的简体中文翻译按 {\"消息ID\": \"中文\"} 填写，消息 ID 取自对应 .grd 的 name 属性。运行 apply_zhcn.py gen 生成片段后，合并进同目录的 zh-CN.xtb。",
+  "IDS_MENU_EXTENSIONS": "扩展应用",
+  "IDS_NO_EXTENSIONS_RUNNING": "还没有运行任何扩展",
+  "IDS_COMMON_TOOLS": "常用工具"
+}

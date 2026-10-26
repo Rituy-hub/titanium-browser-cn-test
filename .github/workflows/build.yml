@@ -1,0 +1,357 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label. Chromium Android builds usually need a large self-hosted runner.
+        required: true
+        type: choice
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - self-hosted
+      publish_release:
+        description: Publish build outputs to a GitHub Release.
+        required: true
+        type: boolean
+        default: false
+      build_arm:
+        description: Build armeabi-v7a APK.
+        required: true
+        type: boolean
+        default: false
+      build_arm64:
+        description: Build arm64-v8a APK.
+        required: true
+        type: boolean
+        default: true
+      build_aab:
+        description: Build arm64 Android App Bundle.
+        required: true
+        type: boolean
+        default: false
+      ninja_jobs:
+        description: Number of Ninja jobs passed to build.sh.
+        required: true
+        type: string
+        default: '14'
+      auto_continue:
+        description: Start another 5.5h cache-warming run when the build times out.
+        required: true
+        type: boolean
+        default: true
+      continue_pass:
+        description: Internal retry counter for auto-continued runs.
+        required: true
+        type: string
+        default: '0'
+      max_continue_passes:
+        description: Maximum number of auto-continued runs after the first timeout.
+        required: true
+        type: string
+        default: '3'
+      build_state_run_id:
+        description: Internal run id containing a previous build-state artifact.
+        required: false
+        type: string
+        default: ''
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  BUILD_STATE_ARTIFACT: helium-build-state
+  CCACHE_MAX_SIZE: 8G
+
+jobs:
+  build:
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 720
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Compute compiler cache key
+        id: cache_key
+        run: |
+          fingerprint="$(sha256sum args.gn vanadium/args.gn build.sh .github/workflows/build.yml | sha256sum | cut -c1-16)"
+          ref_name="$(printf '%s' "$GITHUB_REF_NAME" | tr '/:' '--')"
+          key="helium-ccache-${RUNNER_OS}-${ref_name}-${fingerprint}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          restore_prefix="helium-ccache-${RUNNER_OS}-${ref_name}-${fingerprint}-"
+          echo "CCACHE_KEY=$key" >> "$GITHUB_ENV"
+          echo "CCACHE_RESTORE_PREFIX=$restore_prefix" >> "$GITHUB_ENV"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "restore_prefix=$restore_prefix" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.config/ccache
+          key: ${{ steps.cache_key.outputs.key }}
+          restore-keys: |
+            ${{ steps.cache_key.outputs.restore_prefix }}
+            helium-ccache-${{ runner.os }}-
+
+      - name: Prepare signing config
+        id: signing
+        env:
+          LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
+          STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
+        run: |
+          if [ -n "$LOCAL_TEST_JKS" ] && [ -n "$STORE_TEST_JKS" ]; then
+            echo "LOCAL_TEST_JKS=$LOCAL_TEST_JKS" >> "$GITHUB_ENV"
+            echo "STORE_TEST_JKS=$STORE_TEST_JKS" >> "$GITHUB_ENV"
+            echo "source=secrets" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! command -v keytool >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y openjdk-17-jre-headless
+          fi
+
+          mkdir -p ci-signing
+          printf '%s\n' \
+            'keyAlias=helium-ci' \
+            'keyPassword=android' \
+            'storePassword=android' \
+            > ci-signing/local.properties
+
+          keytool -genkeypair \
+            -keystore ci-signing/test.jks \
+            -storepass android \
+            -keypass android \
+            -alias helium-ci \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Helium CI,O=Helium,C=US"
+
+          echo "LOCAL_TEST_JKS=$(base64 -w0 ci-signing/local.properties)" >> "$GITHUB_ENV"
+          echo "STORE_TEST_JKS=$(base64 -w0 ci-signing/test.jks)" >> "$GITHUB_ENV"
+          echo "source=generated" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare
+        run: |
+          chmod +x *.sh
+          sudo apt-get update
+          sudo apt-get install -y ccache zstd
+
+          export CCACHE_DIR="$HOME/.cache/ccache"
+          mkdir -p "$CCACHE_DIR" "$HOME/.config/ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_NOHASHDIR=true" >> "$GITHUB_ENV"
+          ccache --set-config=max_size="$CCACHE_MAX_SIZE"
+          ccache --set-config=compression=true
+          ccache --zero-stats || true
+
+          version="$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' vanadium/args.gn)"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "BUILD_SUFFIX=${version}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Restore previous build state
+        if: ${{ inputs.build_state_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          BUILD_STATE_RUN_ID: ${{ inputs.build_state_run_id }}
+        run: |
+          mkdir -p build-state
+          if ! gh run download "$BUILD_STATE_RUN_ID" -n "$BUILD_STATE_ARTIFACT" -D build-state; then
+            echo "::warning::No build-state artifact was found for run $BUILD_STATE_RUN_ID."
+            exit 0
+          fi
+
+          if [ ! -f build-state/chromium-build-state.tar.zst ]; then
+            echo "::warning::Build-state artifact did not contain chromium-build-state.tar.zst."
+            exit 0
+          fi
+
+          echo "BUILD_STATE_ARCHIVE=$GITHUB_WORKSPACE/build-state/chromium-build-state.tar.zst" >> "$GITHUB_ENV"
+          ls -lh build-state/chromium-build-state.tar.zst
+
+      - name: Build
+        id: build
+        env:
+          RUNNER_LABEL: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
+          BUILD_ARM: ${{ inputs.build_arm && '1' || '0' }}
+          BUILD_ARM64: ${{ inputs.build_arm64 && '1' || '0' }}
+          BUILD_AAB: ${{ inputs.build_aab && '1' || '0' }}
+          NINJA_JOBS: ${{ inputs.ninja_jobs }}
+        run: |
+          set +e
+          if [ "$RUNNER_LABEL" = "ubuntu-latest" ]; then
+            echo "Running on ubuntu-latest, stopping after 5.5h so cache can be saved."
+            timeout 19800s ./build.sh
+            status=$?
+          else
+            ./build.sh
+            status=$?
+          fi
+
+          set -e
+          if [ "$status" -eq 124 ]; then
+            echo "BUILD_TIMED_OUT=true" >> "$GITHUB_ENV"
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "BUILD_TIMED_OUT=false" >> "$GITHUB_ENV"
+          echo "timed_out=false" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Show compiler cache stats
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Save compiler cache
+        if: always() && steps.cache_key.outputs.key != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.config/ccache
+          key: ${{ steps.cache_key.outputs.key }}
+
+      - name: Package build state
+        id: package_state
+        if: steps.build.outputs.timed_out == 'true'
+        timeout-minutes: 45
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+
+          if [ ! -d chromium/src/out ]; then
+            echo "::warning::No Chromium output directory exists yet."
+            exit 0
+          fi
+
+          mkdir -p build-state
+          cd chromium/src
+          paths=""
+          for path in out/arm out/arm64 out/tmp; do
+            if [ -e "$path" ]; then
+              paths="$paths $path"
+            fi
+          done
+
+          if [ -z "$paths" ]; then
+            echo "::warning::No build output directories were available to package."
+            exit 0
+          fi
+
+          tar --use-compress-program='zstd -1 -T0' \
+            -cf "$GITHUB_WORKSPACE/build-state/chromium-build-state.tar.zst" \
+            $paths
+          ls -lh "$GITHUB_WORKSPACE/build-state/chromium-build-state.tar.zst"
+          echo "has_state=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build state
+        if: steps.package_state.outputs.has_state == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILD_STATE_ARTIFACT }}
+          path: build-state/chromium-build-state.tar.zst
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0
+
+      - name: Collect outputs
+        id: collect
+        run: |
+          outputs="$(find chromium/src/out/release -maxdepth 1 -type f \( -name "${VERSION}-*.apk" -o -name "${VERSION}-*.aab" \) 2>/dev/null | sort || true)"
+          if [ -n "$outputs" ]; then
+            mkdir -p artifacts
+            for output in $outputs; do
+              cp "$output" "artifacts/${BUILD_SUFFIX}-$(basename "$output" | sed "s/^${VERSION}-//")"
+            done
+            sha256sum artifacts/* > "artifacts/${BUILD_SUFFIX}-SHA256SUMS.txt"
+            echo "has_outputs=true" >> "$GITHUB_OUTPUT"
+          else
+            if [ "${BUILD_TIMED_OUT:-false}" != "true" ]; then
+              echo "::error::Build finished without APK/AAB outputs."
+              exit 1
+            fi
+            echo "Chromium build timed out before outputs were produced. Cache was saved for the next run."
+            echo "has_outputs=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Continue timed build
+        if: steps.collect.outputs.has_outputs == 'false' && steps.build.outputs.timed_out == 'true' && steps.package_state.outputs.has_state == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          RUNNER_LABEL: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release || false }}
+          AUTO_CONTINUE: ${{ github.event_name == 'workflow_dispatch' && inputs.auto_continue }}
+          CONTINUE_PASS: ${{ github.event_name == 'workflow_dispatch' && inputs.continue_pass || '0' }}
+          MAX_CONTINUE_PASSES: ${{ github.event_name == 'workflow_dispatch' && inputs.max_continue_passes || '3' }}
+          BUILD_ARM_INPUT: ${{ inputs.build_arm }}
+          BUILD_ARM64_INPUT: ${{ inputs.build_arm64 }}
+          BUILD_AAB_INPUT: ${{ inputs.build_aab }}
+          NINJA_JOBS_INPUT: ${{ inputs.ninja_jobs }}
+        run: |
+          if [ "$AUTO_CONTINUE" != "true" ]; then
+            echo "Auto-continue is disabled."
+            exit 0
+          fi
+
+          case "$CONTINUE_PASS" in
+            ''|*[!0-9]*) CONTINUE_PASS=0 ;;
+          esac
+          case "$MAX_CONTINUE_PASSES" in
+            ''|*[!0-9]*) MAX_CONTINUE_PASSES=3 ;;
+          esac
+
+          if [ "$CONTINUE_PASS" -ge "$MAX_CONTINUE_PASSES" ]; then
+            echo "::error::Build timed out after ${CONTINUE_PASS} continued run(s). Use a self-hosted runner or increase max_continue_passes."
+            exit 1
+          fi
+
+          next_pass=$((CONTINUE_PASS + 1))
+          gh workflow run build.yml \
+            --ref "$GITHUB_REF_NAME" \
+            -f runner="$RUNNER_LABEL" \
+            -f publish_release="$PUBLISH_RELEASE" \
+            -f build_arm="$BUILD_ARM_INPUT" \
+            -f build_arm64="$BUILD_ARM64_INPUT" \
+            -f build_aab="$BUILD_AAB_INPUT" \
+            -f ninja_jobs="$NINJA_JOBS_INPUT" \
+            -f auto_continue=true \
+            -f continue_pass="$next_pass" \
+            -f max_continue_passes="$MAX_CONTINUE_PASSES" \
+            -f build_state_run_id="$GITHUB_RUN_ID"
+
+      - name: Upload artifacts
+        if: steps.collect.outputs.has_outputs == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helium-android-${{ env.BUILD_SUFFIX }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release
+        if: ${{ steps.collect.outputs.has_outputs == 'true' && steps.signing.outputs.source == 'secrets' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)) }}
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.VERSION) }}
+          name: Helium Android ${{ env.VERSION }}
+          generate_release_notes: true
+          files: |
+            artifacts/*
