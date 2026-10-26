@@ -345,6 +345,29 @@ reset_chromium_submodules() {
     '
 }
 
+# Fetch a large Chromium ref with automatic retries. A single shallow fetch of
+# chromium/src can take many minutes; GitHub-hosted runners occasionally see
+# a stalled connection that git aborts after ~1 minute by default. We raised
+# http.lowSpeedTime above, and this wrapper additionally retries a few times so
+# a transient network stall does not fail the whole build.
+git_fetch_retry() {
+    local refspec="$1"
+    local attempts="${2:-5}"
+    local n=1
+    while [ "$n" -le "$attempts" ]; do
+        echo "git fetch attempt $n/$attempts for $refspec"
+        if git fetch --depth 1 "$CHROMIUM_SOURCE" "$refspec"; then
+            echo "git fetch succeeded on attempt $n"
+            return 0
+        fi
+        echo "git fetch attempt $n failed (exit $?); retrying in $((n * 10))s..."
+        sleep "$((n * 10))"
+        n=$((n + 1))
+    done
+    echo "git fetch failed after $attempts attempts" >&2
+    return 1
+}
+
 clear_partial_vpython_cache() {
     local cache_dir="${VPYTHON_ROOT:-$HOME/.cache/vpython-root.0}/store"
 
@@ -498,13 +521,22 @@ else
     git init
     git config user.name "Helium CI"
     git config user.email "helium-ci@localhost"
+    # Increase git network robustness for very large Chromium fetches.
+    # Without these, a slow-but-alive connection is killed by git's default
+    # low-speed timeout after ~1 minute, which is too aggressive for a
+    # shallow fetch of the full Chromium repository.
+    git config --global http.postBuffer 524288000
+    git config --global http.lowSpeedLimit 0
+    git config --global http.lowSpeedTime 999999
+    git config --global http.version HTTP/1.1
+    git config --global fetch.negotiationAlgorithm noop || true
     reset_chromium_checkout
     if ! git remote get-url origin >/dev/null 2>&1; then
         git remote add origin $CHROMIUM_SOURCE
     else
         git remote set-url origin $CHROMIUM_SOURCE
     fi
-    git fetch --depth 1 $CHROMIUM_SOURCE +refs/tags/$VERSION:chromium_$VERSION
+    git_fetch_retry "+refs/tags/$VERSION:chromium_$VERSION"
     git checkout -f $VERSION
     cp "$SCRIPT_DIR/.gclient" ../.gclient
     git submodule foreach git config -f ./.git/config submodule.$name.ignore all
