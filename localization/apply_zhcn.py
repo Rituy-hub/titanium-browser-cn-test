@@ -125,7 +125,31 @@ def audit(src: str):
     return 0
 
 
+def find_matching_xtb(grd: Path):
+    """查找 grd 对应的 zh-CN.xtb。
+
+    Chromium 的 .grd 与 .xtb 可能同目录，也可能在 grd 旁的 translations/ 子目录。
+    返回存在的 xtb 路径；若都不存在返回 None。
+    """
+    base = re.sub(r"\.(grd|grdp)$", "", grd.name)
+    candidates = [
+        grd.parent / "translations" / f"{base}_zh-CN.xtb",
+        grd.with_name(f"{base}_zh-CN.xtb"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
 def inject(root: str, map_path: str, algo: str = "auto"):
+    """将覆盖翻译注入「消息名确实存在的 grd」对应的 zh-CN.xtb。
+
+    关键修复：Chromium 的 zh-CN.xtb 与 .grd 一一对应，不同 grd 的消息集合不同。
+    旧实现把所有消息 id 写进所有 zh-CN.xtb，会把不属于某 grd 的消息 id 污染进该 grd 的 xtb，
+    导致构建期 generate_permission_element_grd.py 等脚本 KeyError。
+    现在只把 overrides 中在该 grd 里真实存在的消息名写入该 grd 对应的 xtb。
+    """
     root_path = Path(root)
     mp = Path(map_path)
     if not mp.exists():
@@ -138,9 +162,14 @@ def inject(root: str, map_path: str, algo: str = "auto"):
         print("[提示] 映射为空，无需注入。")
         return 0
 
+    grds = find_files(root, ".grd") + find_files(root, ".grdp")
+    if not grds:
+        print(f"[错误] 在 {root} 下未找到 .grd/.grdp", file=sys.stderr)
+        return 1
+
     used_algo = algo
     if algo == "auto":
-        for grd in find_files(root, ".grd"):
+        for grd in grds:
             xtb = grd.with_name(re.sub(r"\.(grd|grdp)$", "_zh-CN.xtb", grd.name))
             if xtb.exists():
                 used_algo = detect_algo(grd, xtb)
@@ -149,17 +178,22 @@ def inject(root: str, map_path: str, algo: str = "auto"):
             used_algo = "fnv64"
     print(f"使用哈希算法: {used_algo}")
 
-    xtbs = find_files(root, "zh-CN.xtb")
-    if not xtbs:
-        print(f"[错误] 在 {root} 下未找到 zh-CN.xtb", file=sys.stderr)
-        return 1
-
     added_total = 0
-    for xtb in xtbs:
+    for grd in grds:
+        names = read_names(grd)
+        if not names:
+            continue
+        xtb = find_matching_xtb(grd)
+        if xtb is None:
+            continue
+        # 只取 overrides 中该 grd 真实存在的消息名
+        applicable = {n: v for n, v in overrides.items() if n in names}
+        if not applicable:
+            continue
         ids = read_ids(xtb)
         txt = xtb.read_text(encoding="utf-8", errors="ignore")
         new_nodes = []
-        for name, zh in overrides.items():
+        for name, zh in applicable.items():
             tid = hash_id(name, used_algo)
             if tid in ids:
                 continue
@@ -174,7 +208,8 @@ def inject(root: str, map_path: str, algo: str = "auto"):
             xtb.write_text(txt, encoding="utf-8")
             added_total += len(new_nodes)
             print(f"  + {xtb}: 新增 {len(new_nodes)} 条")
-    print(f"完成，共新增 {added_total} 条中文翻译（仅缺失项，不覆盖已有）。")
+
+    print(f"完成，共新增 {added_total} 条中文翻译（仅注入到消息名真实存在的 grd 对应 xtb，不污染其它 grd）。")
     return 0
 
 
