@@ -119,7 +119,7 @@ if [ "$BUILD_VERSION_INCREMENT" -gt 13000000 ]; then
     echo "BUILD_VERSION_INCREMENT=$BUILD_VERSION_INCREMENT is too large for Chromium Android versionCode." >&2
     exit 1
 fi
-export CHROMIUM_SOURCE=https://chromium.googlesource.com/chromium/src.git # https://github.com/chromium/chromium.git
+export CHROMIUM_SOURCE=https://github.com/chromium/chromium.git # GitHub mirror (fast on GH Actions runners); fallback: https://chromium.googlesource.com/chromium/src.git
 export DEBIAN_FRONTEND=noninteractive
 # The script updates depot_tools explicitly during full source preparation.
 # Disable depot_tools' implicit self-update during gclient/gn/autoninja so a
