@@ -354,9 +354,17 @@ git_fetch_retry() {
     local refspec="$1"
     local attempts="${2:-5}"
     local n=1
+    # Command-line -c overrides any system/global config on the runner.
+    local gargs=(
+        -c http.lowSpeedLimit=0
+        -c http.lowSpeedTime=999999
+        -c http.postBuffer=524288000
+        -c http.version=HTTP/1.1
+        -c fetch.negotiationAlgorithm=noop
+    )
     while [ "$n" -le "$attempts" ]; do
         echo "git fetch attempt $n/$attempts for $refspec"
-        if git fetch --depth 1 "$CHROMIUM_SOURCE" "$refspec"; then
+        if git "${gargs[@]}" fetch --depth 1 "$CHROMIUM_SOURCE" "$refspec"; then
             echo "git fetch succeeded on attempt $n"
             return 0
         fi
@@ -508,10 +516,28 @@ if [ "$SKIP_SOURCE_PREPARE" = "1" ]; then
     cd chromium/src
 else
     # https://github.com/uazo/cromite/blob/master/tools/images/chr-source/prepare-build.sh
+    #
+    # GitHub-hosted runners ship a *system-level* git config that sets
+    # http.lowSpeedLimit=1000 / http.lowSpeedTime=300, which cannot be
+    # overridden by user-level `git config --global`. Use the GIT_CONFIG_COUNT
+    # environment variables (command-line scope, highest priority) so every
+    # git subprocess inherits relaxed low-speed limits. Also pass -c explicitly
+    # on the commands we control directly.
+    export GIT_CONFIG_COUNT=5
+    export GIT_CONFIG_KEY_0=http.lowSpeedLimit
+    export GIT_CONFIG_VALUE_0=0
+    export GIT_CONFIG_KEY_1=http.lowSpeedTime
+    export GIT_CONFIG_VALUE_1=999999
+    export GIT_CONFIG_KEY_2=http.postBuffer
+    export GIT_CONFIG_VALUE_2=524288000
+    export GIT_CONFIG_KEY_3=http.version
+    export GIT_CONFIG_VALUE_3=HTTP/1.1
+    export GIT_CONFIG_KEY_4=fetch.negotiationAlgorithm
+    export GIT_CONFIG_VALUE_4=noop
     if [ ! -d depot_tools/.git ]; then
-        git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+        git -c http.lowSpeedLimit=0 -c http.lowSpeedTime=999999 -c http.postBuffer=524288000 -c http.version=HTTP/1.1 clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
     else
-        git -C depot_tools fetch --depth 1 origin
+        git -C depot_tools -c http.lowSpeedLimit=0 -c http.lowSpeedTime=999999 -c http.postBuffer=524288000 -c http.version=HTTP/1.1 fetch --depth 1 origin
         git -C depot_tools reset --hard origin/HEAD
     fi
     export PATH="$PWD/depot_tools:$PATH"
@@ -522,9 +548,8 @@ else
     git config user.name "Helium CI"
     git config user.email "helium-ci@localhost"
     # Increase git network robustness for very large Chromium fetches.
-    # Without these, a slow-but-alive connection is killed by git's default
-    # low-speed timeout after ~1 minute, which is too aggressive for a
-    # shallow fetch of the full Chromium repository.
+    # GIT_CONFIG_* environment variables are already exported above; the
+    # user-level git config below is a harmless extra fallback.
     git config --global http.postBuffer 524288000
     git config --global http.lowSpeedLimit 0
     git config --global http.lowSpeedTime 999999
