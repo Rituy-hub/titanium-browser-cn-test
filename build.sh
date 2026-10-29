@@ -199,6 +199,19 @@ restore_build_state() {
         tar -xf "$BUILD_STATE_ARCHIVE" -C .
         du -sh out/arm out/arm64 out/tmp 2>/dev/null || true
         export BUILD_STATE_RESTORED=1
+        # 复用已恢复 out 目录中的 ext_version_increment，避免每次运行基于当前时间
+        # 重新计算导致 args.gn 不匹配，从而跳过 gn gen 并复用 .ninja_log 增量构建。
+        for d in out/arm64 out/arm; do
+            if [ -f "$d/args.gn" ]; then
+                saved_inc="$(grep -m1 '^ext_version_increment[[:space:]]*=' "$d/args.gn" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+                if [ -n "$saved_inc" ] && [ "$saved_inc" != "$BUILD_VERSION_INCREMENT" ]; then
+                    echo "Reusing saved ext_version_increment=$saved_inc from $d/args.gn (was $BUILD_VERSION_INCREMENT)"
+                    BUILD_VERSION_INCREMENT="$saved_inc"
+                    export BUILD_VERSION_INCREMENT
+                fi
+                break
+            fi
+        done
     fi
 }
 
