@@ -216,8 +216,13 @@ restore_build_state() {
 }
 
 refresh_restored_outputs() {
+    # IMPORTANT: Do NOT touch timestamps of restored outputs.
+    # Updating mtimes makes build.ninja's GN-input dependencies look newer than
+    # build.ninja itself, forcing "Regenerating ninja files" which resets
+    # .ninja_log and causes a full rebuild on every resumed run.
+    # Keeping original tar timestamps lets plain ninja resume incrementally.
     if [ "${BUILD_STATE_RESTORED:-0}" = "1" ] && [ -d "$1" ]; then
-        find "$1" -exec touch -h {} +
+        echo "Keeping original timestamps for restored output dir $1 (no touch)."
     fi
 }
 
