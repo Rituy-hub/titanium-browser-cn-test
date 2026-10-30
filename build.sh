@@ -216,13 +216,26 @@ restore_build_state() {
 }
 
 refresh_restored_outputs() {
-    # IMPORTANT: Do NOT touch timestamps of restored outputs.
-    # Updating mtimes makes build.ninja's GN-input dependencies look newer than
-    # build.ninja itself, forcing "Regenerating ninja files" which resets
-    # .ninja_log and causes a full rebuild on every resumed run.
-    # Keeping original tar timestamps lets plain ninja resume incrementally.
+    # IMPORTANT: Do NOT touch ALL restored outputs. Updating every mtime makes
+    # build.ninja's GN-input dependencies look newer than build.ninja itself,
+    # forcing "Regenerating ninja files" which resets .ninja_log and causes a
+    # full rebuild on every resumed run.
+    #
+    # However, we MUST touch build.ninja (and build.ninja.d if present):
+    # after a fresh git checkout the source .gn/BUILD.gn files carry the
+    # checkout timestamp (now), which is newer than the restored build.ninja.
+    # ninja then decides build.ninja is stale -> Regenerating ninja files ->
+    # .ninja_log invalidated -> full rebuild. Touching just the build files to
+    # "now" makes ninja consider them up-to-date while .ninja_log stays valid,
+    # giving a true incremental resume.
     if [ "${BUILD_STATE_RESTORED:-0}" = "1" ] && [ -d "$1" ]; then
-        echo "Keeping original timestamps for restored output dir $1 (no touch)."
+        echo "Keeping original timestamps for restored outputs in $1; refreshing only ninja build files."
+        for f in "$1/build.ninja" "$1/build.ninja.d"; do
+            if [ -e "$f" ]; then
+                touch -h "$f"
+                echo "Touched $(basename "$f") -> $(stat -c %y "$f")"
+            fi
+        done
     fi
 }
 
