@@ -50,7 +50,7 @@ on:
         description: Maximum number of auto-continued runs after the first timeout.
         required: true
         type: string
-        default: '3'
+        default: '30'
       build_state_run_id:
         description: Internal run id containing a previous build-state artifact.
         required: false

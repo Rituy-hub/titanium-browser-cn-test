@@ -221,21 +221,28 @@ refresh_restored_outputs() {
     # forcing "Regenerating ninja files" which resets .ninja_log and causes a
     # full rebuild on every resumed run.
     #
-    # However, we MUST touch build.ninja (and build.ninja.d if present):
-    # after a fresh git checkout the source .gn/BUILD.gn files carry the
-    # checkout timestamp (now), which is newer than the restored build.ninja.
-    # ninja then decides build.ninja is stale -> Regenerating ninja files ->
-    # .ninja_log invalidated -> full rebuild. Touching just the build files to
-    # "now" makes ninja consider them up-to-date while .ninja_log stays valid,
-    # giving a true incremental resume.
+    # We only touch build.ninja and build.ninja.d. The depfile must be touched
+    # FIRST, then build.ninja, so that build.ninja is STRICTLY newer than
+    # build.ninja.d. In ninja's generator rule, build.ninja.d is an implicit
+    # input of build.ninja; if build.ninja.d is even a few microseconds newer,
+    # ninja re-runs "gn gen" -> Regenerating ninja files -> .ninja_log
+    # invalidated -> full rebuild. (Observed in runs 21/22: build.ninja.d was
+    # 4us newer than build.ninja and regeneration still fired.)
     if [ "${BUILD_STATE_RESTORED:-0}" = "1" ] && [ -d "$1" ]; then
         echo "Keeping original timestamps for restored outputs in $1; refreshing only ninja build files."
-        for f in "$1/build.ninja" "$1/build.ninja.d"; do
-            if [ -e "$f" ]; then
-                touch -h "$f"
-                echo "Touched $(basename "$f") -> $(stat -c %y "$f")"
-            fi
-        done
+        if [ -e "$1/build.ninja.d" ]; then
+            touch -h "$1/build.ninja.d"
+            echo "Touched build.ninja.d -> $(stat -c %y "$1/build.ninja.d")"
+        fi
+        if [ -e "$1/build.ninja" ]; then
+            touch -h "$1/build.ninja"
+            echo "Touched build.ninja -> $(stat -c %y "$1/build.ninja")"
+        fi
+        # Force build.ninja mtime strictly newer than depfile (safety margin).
+        if [ -e "$1/build.ninja" ] && [ -e "$1/build.ninja.d" ]; then
+            touch -h -d "+1 second" "$1/build.ninja"
+            echo "Forced build.ninja -> $(stat -c %y "$1/build.ninja")"
+        fi
     fi
 }
 
