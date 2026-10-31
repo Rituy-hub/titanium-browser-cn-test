@@ -195,6 +195,12 @@ jobs:
           NINJA_JOBS: ${{ inputs.ninja_jobs }}
         run: |
           set +e
+          # 诊断：确认 build.sh 是否存在于工作目录（排查偶发 checkout 问题）
+          echo "=== DIAG: workspace files ==="
+          pwd
+          ls -la build.sh 2>&1 || echo "build.sh MISSING"
+          ls -la | head -20
+          echo "=== DIAG end ==="
           if [ "$RUNNER_LABEL" = "ubuntu-latest" ]; then
             echo "Running on ubuntu-latest, stopping after 5.5h so cache can be saved."
             timeout 19800s ./build.sh
